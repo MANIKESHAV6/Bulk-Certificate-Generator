@@ -5,7 +5,10 @@ from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.pdfgen import canvas
 from reportlab.pdfbase.pdfmetrics import stringWidth
+from io import BytesIO
 
+import qrcode
+from reportlab.lib.utils import ImageReader
 
 def _draw_centered_text(
     pdf, text, x_center, y, font_name, font_size, max_width
@@ -28,6 +31,7 @@ def generate_certificate(
     completion_date: str,
     certificate_id: str,
     output_path: str,
+    verification_url: str | None = None,
 ) -> str:
     """Generate one PDF certificate and return its file path."""
 
@@ -42,6 +46,11 @@ def generate_certificate(
     for field_name, value in fields.items():
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f"{field_name} must be a non-empty string")
+
+    if verification_url is None:
+        verification_url = (
+            f"http://127.0.0.1:8000/api/verify/{certificate_id}"
+        )
 
     # Create the output folder if it doesn't exist
     output_file = Path(output_path)
@@ -127,6 +136,36 @@ def generate_certificate(
     pdf.setFont("Helvetica", 11)
     pdf.drawRightString(
         page_width - 80, 60, certificate_id.strip()
+    )
+
+    # Create a QR code containing the certificate verification URL.
+    qr_image = qrcode.make(verification_url)
+
+    # Convert the QR image into an in-memory PNG.
+    qr_buffer = BytesIO()
+    qr_image.save(qr_buffer, format="PNG")
+    qr_buffer.seek(0)
+
+    # Place the QR code in the lower-right area of the certificate.
+    qr_x = page_width - 112
+    qr_y = 132
+    qr_size = 64
+
+    pdf.drawImage(
+        ImageReader(qr_buffer),
+        qr_x,
+        qr_y,
+        width=qr_size,
+        height=qr_size,
+        mask="auto",
+    )
+
+    pdf.setFillColor(navy)
+    pdf.setFont("Helvetica-Bold", 7)
+    pdf.drawCentredString(
+        qr_x + qr_size / 2,
+        qr_y - 11,
+        "SCAN TO VERIFY",
     )
 
     # Finish and save the PDF

@@ -1,5 +1,7 @@
 
-from pydantic import BaseModel, Field, ConfigDict
+from datetime import datetime
+
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class RecipientInput(BaseModel):
@@ -30,3 +32,24 @@ class JobResponse(BaseModel):
     success_count: int
     failure_count: int
     recipients: list[RecipientResult]
+
+
+class CertificateVerificationResponse(BaseModel):
+    certificate_id: str
+    valid: bool
+    status: str
+    recipient_name: str
+    course_name: str
+    completion_date: str
+
+
+class CertificateRevocationRequest(BaseModel):
+    reason: str = Field(min_length=5, max_length=500)
+
+
+class CertificateRevocationResponse(BaseModel):
+    certificate_id: str
+    revoked: bool
+    status: str
+    revoked_at: datetime | None = None
+    reason: str | None = None

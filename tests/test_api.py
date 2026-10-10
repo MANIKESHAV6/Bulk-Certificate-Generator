@@ -4,7 +4,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
-
+from app.services import certificate_generator as generator_module
 from app import main
 from app.database import Base, get_db
 from app.services.certificate_generator import (
@@ -202,6 +202,192 @@ def test_unknown_job_and_certificate_return_404(api_client):
     certificate_response = api_client.get(
         "/api/certificates/nonexistent-certificate/download"
     )
+    verification_response = api_client.get(
+    "/api/verify/nonexistent-certificate"
+    )
 
+    assert verification_response.status_code == 404
     assert job_response.status_code == 404
     assert certificate_response.status_code == 404
+
+
+def test_verify_successful_certificate(api_client):
+    response = api_client.post(
+        "/api/jobs",
+        json=sample_request(),
+    )
+
+    assert response.status_code == 200
+
+    recipient = response.json()["recipients"][0]
+    certificate_id = recipient["certificate_id"]
+
+    verify_response = api_client.get(
+        f"/api/verify/{certificate_id}"
+    )
+
+    assert verify_response.status_code == 200
+
+    data = verify_response.json()
+
+    assert data["certificate_id"] == certificate_id
+    assert data["valid"] is True
+    assert data["status"] == "VALID"
+    assert data["recipient_name"] == recipient["name"]
+    assert data["course_name"] == "Python Backend Development"
+    assert data["completion_date"] == "10 October 2026"
+
+def test_pdf_generation_uses_verification_qr(api_client, monkeypatch):
+    captured_urls = []
+    real_qr_make = generator_module.qrcode.make
+
+    def tracking_qr_make(data, *args, **kwargs):
+        captured_urls.append(data)
+        return real_qr_make(data, *args, **kwargs)
+
+    monkeypatch.setattr(
+        generator_module.qrcode,
+        "make",
+        tracking_qr_make,
+    )
+
+    response = api_client.post(
+        "/api/jobs",
+        json=sample_request(),
+    )
+
+    assert response.status_code == 200
+
+    recipients = response.json()["recipients"]
+
+    expected_urls = {
+        f"{main.PUBLIC_BASE_URL}/api/verify/{item['certificate_id']}"
+        for item in recipients
+    }
+
+    assert set(captured_urls) == expected_urls
+    assert len(captured_urls) == len(recipients)
+
+
+def test_revoke_certificate_invalidates_verification_and_download(
+    api_client,
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "CERTIFICATE_ADMIN_TOKEN",
+        "test-admin-token",
+    )
+
+    response = api_client.post(
+        "/api/jobs",
+        json=sample_request(),
+    )
+    assert response.status_code == 200
+
+    recipient = response.json()["recipients"][0]
+    certificate_id = recipient["certificate_id"]
+
+    # Verify the certificate before revocation.
+    before = api_client.get(
+        f"/api/verify/{certificate_id}"
+    )
+    assert before.status_code == 200
+    assert before.json()["valid"] is True
+
+    # Revoke the certificate using the administrator token.
+    revoke_response = api_client.post(
+        f"/api/certificates/{certificate_id}/revoke",
+        headers={"X-Admin-Token": "test-admin-token"},
+        json={"reason": "Issued to the wrong recipient"},
+    )
+
+    assert revoke_response.status_code == 200
+    revoke_data = revoke_response.json()
+
+    assert revoke_data["revoked"] is True
+    assert revoke_data["status"] == "REVOKED"
+    assert revoke_data["reason"] == "Issued to the wrong recipient"
+    assert revoke_data["revoked_at"] is not None
+
+    # Verification must now report that the certificate is revoked.
+    after = api_client.get(
+        f"/api/verify/{certificate_id}"
+    )
+    assert after.status_code == 200
+    assert after.json()["valid"] is False
+    assert after.json()["status"] == "REVOKED"
+
+    # Downloads must be refused after revocation.
+    download_response = api_client.get(
+        f"/api/certificates/{certificate_id}/download"
+    )
+    assert download_response.status_code == 410
+
+    # Repeating the revoke request must preserve the original reason.
+    repeated = api_client.post(
+        f"/api/certificates/{certificate_id}/revoke",
+        headers={"X-Admin-Token": "test-admin-token"},
+        json={"reason": "A different reason"},
+    )
+
+    assert repeated.status_code == 200
+    assert repeated.json()["reason"] == "Issued to the wrong recipient"
+
+
+def test_revocation_rejects_wrong_admin_token(
+    api_client,
+    monkeypatch,
+):
+    monkeypatch.setenv(
+        "CERTIFICATE_ADMIN_TOKEN",
+        "test-admin-token",
+    )
+
+    response = api_client.post(
+        "/api/jobs",
+        json=sample_request(),
+    )
+    assert response.status_code == 200
+
+    certificate_id = response.json()["recipients"][0]["certificate_id"]
+
+    revoke_response = api_client.post(
+        f"/api/certificates/{certificate_id}/revoke",
+        headers={"X-Admin-Token": "incorrect-token"},
+        json={"reason": "Administrative correction"},
+    )
+
+    assert revoke_response.status_code == 403
+
+    # The certificate remains valid because the attempted revocation failed.
+    verify_response = api_client.get(
+        f"/api/verify/{certificate_id}"
+    )
+    assert verify_response.status_code == 200
+    assert verify_response.json()["valid"] is True
+
+
+def test_revocation_requires_configured_token(
+    api_client,
+    monkeypatch,
+):
+    monkeypatch.delenv(
+        "CERTIFICATE_ADMIN_TOKEN",
+        raising=False,
+    )
+
+    response = api_client.post(
+        "/api/jobs",
+        json=sample_request(),
+    )
+    assert response.status_code == 200
+
+    certificate_id = response.json()["recipients"][0]["certificate_id"]
+
+    revoke_response = api_client.post(
+        f"/api/certificates/{certificate_id}/revoke",
+        headers={"X-Admin-Token": "some-token"},
+        json={"reason": "Administrative correction"},
+    )
+
+    assert revoke_response.status_code == 503
