@@ -3,6 +3,7 @@ from datetime import datetime
 from uuid import uuid4
 
 from sqlalchemy import (
+    Boolean,
     Column,
     DateTime,
     ForeignKey,
@@ -67,8 +68,18 @@ class Recipient(Base):
     status = Column(String(20), nullable=False, default="PENDING")
 
     file_path = Column(String(500), nullable=True)
-    error_message = Column(String(1000), nullable=True)
 
+    error_message = Column(String(1000), nullable=True)
+    is_revoked = Column(
+    Boolean,
+    nullable=False,
+    default=False,
+    server_default="0",
+    )
+
+    revoked_at = Column(DateTime(timezone=True), nullable=True)
+
+    revocation_reason = Column(String(500), nullable=True)
     job = relationship(
         "GenerationJob",
         back_populates="recipients",

@@ -1,4 +1,9 @@
 
+import os
+import secrets
+from datetime import datetime, timezone
+
+from fastapi import Header
 from pathlib import Path
 from uuid import uuid4
 
@@ -10,16 +15,27 @@ from app import models
 from app.models import GenerationJob, Recipient
 from app.schemas import (
     BulkCertificateRequest,
+    CertificateRevocationRequest,
+    CertificateRevocationResponse,
     JobResponse,
     RecipientResult,
 )
+from app.migrations import ensure_revocation_columns
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from app.services.certificate_generator import generate_certificate
+import os
 
+from app.schemas import (
+    BulkCertificateRequest,
+    CertificateVerificationResponse,
+    JobResponse,
+    RecipientResult,
+)
 
 # Create missing database tables.
 Base.metadata.create_all(bind=engine)
+ensure_revocation_columns(engine)
 
 app = FastAPI(
     title="Bulk Certificate Generator",
@@ -31,6 +47,10 @@ app = FastAPI(
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CERTIFICATE_DIR = PROJECT_ROOT / "generated_certificates"
 
+PUBLIC_BASE_URL = os.getenv(
+    "PUBLIC_BASE_URL",
+    "http://127.0.0.1:8000",
+).rstrip("/")
 
 @app.get("/")
 def home():
@@ -43,6 +63,116 @@ def home():
 @app.get("/health")
 def health_check():
     return {"status": "healthy"}
+
+@app.get(
+    "/api/verify/{certificate_id}",
+    response_model=CertificateVerificationResponse,
+)
+def verify_certificate(
+    certificate_id: str,
+    db: Session = Depends(get_db),
+):
+    recipient = (
+        db.query(Recipient)
+        .filter(Recipient.certificate_id == certificate_id)
+        .first()
+    )
+
+    if recipient is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Certificate not found",
+        )
+
+    if recipient.is_revoked:
+        is_valid = False
+        verification_status = "REVOKED"
+    elif recipient.status == "SUCCESS":
+        is_valid = True
+        verification_status = "VALID"
+    else:
+        is_valid = False
+        verification_status = "NOT_VALID"
+
+    return CertificateVerificationResponse(
+        certificate_id=recipient.certificate_id,
+        valid=is_valid,
+        status=verification_status,
+        recipient_name=recipient.name,
+        course_name=recipient.course_name,
+        completion_date=recipient.completion_date,
+    )
+
+
+@app.post(
+    "/api/certificates/{certificate_id}/revoke",
+    response_model=CertificateRevocationResponse,
+)
+def revoke_certificate(
+    certificate_id: str,
+    request: CertificateRevocationRequest,
+    x_admin_token: str | None = Header(
+        default=None,
+        alias="X-Admin-Token",
+    ),
+    db: Session = Depends(get_db),
+):
+    # Revocation must be explicitly configured by the operator.
+    configured_token = os.getenv("CERTIFICATE_ADMIN_TOKEN")
+
+    if not configured_token:
+        raise HTTPException(
+            status_code=503,
+            detail="Certificate revocation is not configured",
+        )
+
+    # Only a caller with the configured administrator token may revoke.
+    if (
+        not x_admin_token
+        or not secrets.compare_digest(
+            x_admin_token,
+            configured_token,
+        )
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid or missing administrator token",
+        )
+
+    recipient = (
+        db.query(Recipient)
+        .filter(Recipient.certificate_id == certificate_id)
+        .first()
+    )
+
+    if recipient is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Certificate not found",
+        )
+
+    if recipient.status != "SUCCESS":
+        raise HTTPException(
+            status_code=409,
+            detail="Only successfully generated certificates can be revoked",
+        )
+
+    # Repeated requests do not overwrite the original revocation details.
+    if not recipient.is_revoked:
+        recipient.is_revoked = True
+        recipient.revoked_at = datetime.now(timezone.utc)
+        recipient.revocation_reason = request.reason.strip()
+
+        db.commit()
+        db.refresh(recipient)
+
+    return CertificateRevocationResponse(
+        certificate_id=recipient.certificate_id,
+        revoked=recipient.is_revoked,
+        status="REVOKED" if recipient.is_revoked else "VALID",
+        revoked_at=recipient.revoked_at,
+        reason=recipient.revocation_reason,
+    )
 
 
 @app.post("/api/jobs", response_model=JobResponse)
@@ -91,6 +221,9 @@ def create_generation_job(
                 completion_date=recipient.completion_date,
                 certificate_id=recipient.certificate_id,
                 output_path=str(output_path),
+                verification_url=(
+                    f"{PUBLIC_BASE_URL}/api/verify/{recipient.certificate_id}"
+                ),
             )
 
             recipient.status = "SUCCESS"
@@ -206,6 +339,12 @@ def download_certificate(
         raise HTTPException(
             status_code=409,
             detail="Certificate is not available because generation did not succeed",
+        )
+
+    if recipient.is_revoked:
+        raise HTTPException(
+            status_code=410,
+            detail="Certificate has been revoked",
         )
 
     file_path = Path(recipient.file_path)
